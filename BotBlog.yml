@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion:  2010-09-09
+
+Description: 'This template creates a Kinesis Firehose Delivery Stream that uses Lambda to identify and blok fake Google and Bing Bots'
+
+Parameters: 
+  KinesisBufferIntervalSeconds: 
+    Default: 900
+    Description: The frequency of data delivery to Amazon S3 is determined by the Amazon S3 Buffer size and Buffer interval value that you configured for your delivery stream. Kinesis Data Firehose buffers incoming data before delivering it to Amazon S3. You can configure the values for Amazon S3 Buffer size (1-128 MB) or Buffer interval (60 – 900 seconds), and the condition satisfied first triggers data delivery to Amazon S3    
+    Type: Number
+    MinValue: 60
+    MaxValue: 900
+  KinesisBufferSizeMB: 
+    Default: 3
+    Description: The frequency of data delivery to Amazon S3 is determined by the Amazon S3 Buffer size and Buffer interval value that you configured for your delivery stream. Kinesis Data Firehose buffers incoming data before delivering it to Amazon S3. You can configure the values for Amazon S3 Buffer size (1-128 MB) or Buffer interval (60 – 900 seconds), and the condition satisfied first triggers data delivery to Amazon S3    
+    Type: Number
+    MinValue: 1
+    MaxValue: 128
+  IPSetName:
+    Default: BlockFakeBotIPSet
+    Description: Name of IP Set created to block fake bot IP addreesses
+    Type: String
+  IPSetScope:
+    Default: CLOUDFRONT
+    Description: Scope of IP Set (REGIONAL|CLOUDFRONT) created to block fake bot IP addreesses
+    Type: String
+  S3BucketWithDeploymentPackage: 
+    Default: waf-logs-fake-bots-us-east-1
+    Description: S3 Bucket name with deployment package in it
+    Type: String
+  DeploymentPackageZipedFilename:
+    Default: lambda_function.py.zip   
+    Description: Filename of zipped deployment package
+    Type: String
+    
+Resources:
+  BlockFakeBotIPSet:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Description: IPSet for blocking Fake Bot
+      Name: !Ref IPSetName
+      Scope: !Ref IPSetScope
+      IPAddressVersion: IPV4
+      Addresses:
+        - 0.0.0.0/32
+
+  LambdaExecutionRole:
+    DependsOn: BlockFakeBotIPSet
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: lambdaBasicExecutionBotBlock
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*LambdaFunction*
+              - Effect: Allow
+                Action:
+                  - wafv2:GetIPSet
+                  - wafv2:UpdateIPSet
+                Resource: !GetAtt BlockFakeBotIPSet.Arn
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref S3BucketWithDeploymentPackage
+        S3Key: !Ref DeploymentPackageZipedFilename    
+      Runtime: python3.8
+      Timeout: 60
+      Environment:
+        Variables:
+          IPSetId: !GetAtt BlockFakeBotIPSet.Id
+          IPSetName: !Ref IPSetName
+          IPSetScope: !Ref IPSetScope
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration: 
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      BucketName:
+        !Join
+          - ''
+          - - !Ref 'AWS::AccountId'
+            - '-waf-logs-fake-bots-us-east-1-25'
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+      Policies:
+        -
+          PolicyName: kinesis_delivery_block_bot
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Join
+                      - ''
+                      - - 'arn:aws:s3:::'
+                        - !Ref S3Bucket
+                  - !Join
+                      - ''
+                      - - 'arn:aws:s3:::'
+                        - !Ref S3Bucket
+                        - '/*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource:
+                  - !GetAtt LambdaFunction.Arn
+                  - !Join
+                      - ''
+                      - - !GetAtt LambdaFunction.Arn
+                        - ':*'
+  FireHoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName:
+        !Join
+          - ''
+          - - 'aws-waf-logs-'
+            - !Ref AWS::StackName
+      ExtendedS3DestinationConfiguration:
+        BucketARN:
+          !Join
+            - ''
+            - - 'arn:aws:s3:::'
+              - !Ref S3Bucket
+        BufferingHints:
+          IntervalInSeconds: !Ref KinesisBufferIntervalSeconds
+          SizeInMBs: !Ref KinesisBufferSizeMB
+        CompressionFormat: UNCOMPRESSED
+        Prefix: waf-firehose/
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Parameters:
+              - ParameterName: LambdaArn
+                ParameterValue: !GetAtt LambdaFunction.Arn
+              - ParameterName: BufferSizeInMBs
+                ParameterValue: '1'
+              - ParameterName: BufferIntervalInSeconds
+                ParameterValue: '60'
+              Type: Lambda
+  
+  FakeBotWebACL:
+    DependsOn: BlockFakeBotIPSet
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: FakeBotWebACL
+      Scope: !Ref IPSetScope
+      Description: This WebACL demonstrate how to block fake Google and Bing Bots
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: FakeBotWebACLMetric
+      Rules:
+        - Name: BlockFakeBots
+          Priority: 0
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: BlockFakeBotsMetric
+          Statement:
+            AndStatement:
+              Statements:
+                - OrStatement:
+                    Statements:
+                      - ByteMatchStatement:
+                          SearchString: google
+                          FieldToMatch:
+                            SingleHeader: {"Name": "User-Agent"}
+                          TextTransformations:
+                            - Priority: 1
+                              Type: LOWERCASE
+                          PositionalConstraint: CONTAINS
+                      - ByteMatchStatement:
+                          SearchString: bing
+                          FieldToMatch:
+                            SingleHeader: {"Name": "User-Agent"}
+                          TextTransformations:
+                            - Priority: 1
+                              Type: LOWERCASE
+                          PositionalConstraint: CONTAINS
+                - IPSetReferenceStatement:
+                    Arn: !GetAtt BlockFakeBotIPSet.Arn
+        - Name: RuleWithAWSManagedRules
+          Priority: 1
+          OverrideAction:
+            Count: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RuleWithAWSManagedRulesMetric
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+Outputs:
+  BlockFakeBotIPSet:
+    Description: 'IP Set containing Fake Bot IP addresses'
+    Value: !GetAtt BlockFakeBotIPSet.Arn
+  LambdaExecutionRole:
+    Description: 'Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+  LambdaFunction:
+    Description: 'Lambda Function to detect fake bots and modify IP Set'
+    Value: !GetAtt LambdaFunction.Arn
+  S3Bucket:
+    Description: 'S3 Bucket for WAF Logs'
+    Value: !Ref S3Bucket
+  FirehoseDeliveryRole:
+    Description: 'IAM role for S3 delivery by Firehose'
+    Value: !GetAtt FirehoseDeliveryRole.Arn
+  FireHoseDeliveryStream:
+    Description: 'Firehose Delivery Stream associated with WAF logging'
+    Value: !GetAtt FireHoseDeliveryStream.Arn
+  FakeBotWebACL:
+    Description: 'WebACL'
+    Value: !GetAtt FakeBotWebACL.Arn
+
+
+
+
+
+
+
