@@ -27,7 +27,7 @@ Parameters:
     Default: waf-logs-fake-bots-us-east-1
     Description: S3 Bucket name with deployment package in it
     Type: String
-  DeploymentPackageZipedFilename:
+  DeploymentPackageZippedFilename:
     Default: lambda_function.py.zip   
     Description: Filename of zipped deployment package
     Type: String
